@@ -58,7 +58,7 @@ module test_bf16_golden;
                 opb = b;
                 fpu_op = op_num[2:0];
                 rmode = mode_num[1:0];
-                repeat (4) @(posedge clk);
+                repeat (5) @(posedge clk);
                 #2;
                 tests = tests + 1;
                 same = (is_nan(expected) && is_nan(out)) || (out === expected);
@@ -73,7 +73,7 @@ module test_bf16_golden;
         $fclose(fd);
         $display("BF16 GOLDEN: %0d cases, %0d mismatches", tests, errors);
         if (errors != 0)
-            $display("BF16_ORACLE_MISMATCHES (investigate before claiming equivalence)");
+            $fatal(1, "BF16_ORACLE_MISMATCHES: %0d mismatches", errors);
         else
             $display("BF16_ORACLE_PASSED");
         $finish;
