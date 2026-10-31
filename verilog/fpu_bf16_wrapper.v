@@ -33,21 +33,32 @@ module fpu_bf16_wrapper (
     wire fp32_inf, fp32_snan, fp32_qnan, fp32_ine;
     wire fp32_overflow, fp32_underflow, fp32_zero, fp32_div_by_zero;
 
-    // The legacy FP32 core misclassifies Inf*Inf as NaN and Inf/Inf as Inf.
+    // The legacy FP32 core misclassifies Inf*Inf and Inf/Inf. Streaming
+    // verification also exposes misaligned infinity-pair add/sub results.
     // Classify these BF16 operands at ingress and carry the overrides through
     // the same four pipeline stages as the source core.
     wire opa_is_inf = (&opa[14:7]) && !(|opa[6:0]);
     wire opb_is_inf = (&opb[14:7]) && !(|opb[6:0]);
     wire inf_pair = opa_is_inf && opb_is_inf;
+    wire addsub_pair = inf_pair && (fpu_op == 3'd0 || fpu_op == 3'd1);
+    wire effective_b_sign = opb[15] ^ (fpu_op == 3'd1);
+    wire addsub_same_sign = opa[15] == effective_b_sign;
     reg [3:0] mul_inf_pipe, div_nan_pipe, sign_pipe;
+    reg [3:0] addsub_inf_pipe, addsub_nan_pipe, addsub_sign_pipe;
     always @(posedge clk) begin
         mul_inf_pipe <= {mul_inf_pipe[2:0], inf_pair && (fpu_op == 3'd2)};
         div_nan_pipe <= {div_nan_pipe[2:0], inf_pair && (fpu_op == 3'd3)};
         sign_pipe <= {sign_pipe[2:0], opa[15] ^ opb[15]};
+        addsub_inf_pipe <= {addsub_inf_pipe[2:0], addsub_pair && addsub_same_sign};
+        addsub_nan_pipe <= {addsub_nan_pipe[2:0], addsub_pair && !addsub_same_sign};
+        addsub_sign_pipe <= {addsub_sign_pipe[2:0], opa[15]};
     end
     wire corrected_mul_inf = mul_inf_pipe[3];
     wire corrected_div_nan = div_nan_pipe[3];
-    wire corrected_special = corrected_mul_inf || corrected_div_nan;
+    wire corrected_inf = corrected_mul_inf || addsub_inf_pipe[3];
+    wire corrected_nan = corrected_div_nan || addsub_nan_pipe[3];
+    wire corrected_special = corrected_inf || corrected_nan;
+    wire corrected_sign = corrected_mul_inf ? sign_pipe[3] : addsub_sign_pipe[3];
 
     // BF16 encodings are exact FP32 numbers when 16 zero fraction bits
     // are appended. Keep opa/opb widths constant for all arithmetic ops.
@@ -89,8 +100,8 @@ module fpu_bf16_wrapper (
 
     // FP32 NaNs can have their payload exclusively in the low 16 fraction
     // bits; preserve the NaN class rather than accidentally producing Inf.
-    assign out = corrected_mul_inf ? {sign_pipe[3], 8'hff, 7'b0} :
-                 corrected_div_nan ? 16'h7fc0 :
+    assign out = corrected_inf ? {corrected_sign, 8'hff, 7'b0} :
+                 corrected_nan ? 16'h7fc0 :
                  fp32_is_nan ? {top[15], 8'hff, 1'b1, 6'b0} :
                  fp32_is_inf ? {top[15], 8'hff, 7'b0} :
                  finite_rounded;
@@ -108,10 +119,10 @@ module fpu_bf16_wrapper (
                        (&top[6:0]) && discarded_nonzero));
     assign underflow = !corrected_special && (fp32_underflow ||
                        (finite && bf16_is_subnormal_or_zero && bf16_inexact));
-    assign inf = corrected_mul_inf ||
+    assign inf = corrected_inf ||
                  (!corrected_special && (fp32_inf || (!fp32_is_nan && bf16_is_inf)));
     assign zero = bf16_is_zero;
-    assign qnan = corrected_div_nan || (!corrected_special && fp32_qnan);
+    assign qnan = corrected_nan || (!corrected_special && fp32_qnan);
     assign snan = !corrected_special && fp32_snan;
     assign div_by_zero = !corrected_special && fp32_div_by_zero;
 
