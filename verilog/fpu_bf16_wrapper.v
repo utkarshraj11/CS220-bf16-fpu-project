@@ -1,10 +1,9 @@
-// Hybrid BF16 arithmetic prototype with a native BF16 multiplier.
+// Hybrid BF16 arithmetic prototype with native BF16 mul/div datapaths.
 //
 // BF16: sign[15], exponent[14:7] (bias 127), fraction[6:0].
-// Multiplication uses the native 8x8-significand BF16 datapath. Addition,
-// subtraction and division still use the OpenCores FP32 core with BF16
-// quantization. The legacy FP32 instance is retained for those operations;
-// area and power savings must be measured, not assumed.
+// Multiplication and division use native BF16 significands. Addition and
+// subtraction still use the OpenCores FP32 core with BF16 quantization.
+// Area and power savings must be measured, not assumed.
 //
 // Floating point operations: 0:add, 1:sub, 2:mul, 3:div.
 // Rounding modes (OpenCores): 0:nearest-even, 1:zero, 2:+infinity, 3:-infinity.
@@ -45,45 +44,57 @@ module fpu_bf16_wrapper (
         .underflow(native_mul_underflow)
     );
 
+    // Native BF16 divider has the same four-edge latency as multiplication.
+    // Keeping the paths independent allows mixed operations every clock.
+    wire [15:0] native_div_result;
+    wire native_div_invalid, native_div_by_zero, native_div_inexact;
+    wire native_div_overflow, native_div_underflow;
+    bf16_div_pipeline u_native_div (
+        .clk(clk), .opa(opa), .opb(opb), .rmode(rmode),
+        .result(native_div_result), .invalid(native_div_invalid),
+        .div_by_zero(native_div_by_zero), .inexact(native_div_inexact),
+        .overflow(native_div_overflow), .underflow(native_div_underflow)
+    );
+
     wire op_is_mul = (fpu_op == 3'd2);
+    wire op_is_div = (fpu_op == 3'd3);
     wire a_is_snan = (&opa[14:7]) && !opa[6] && (|opa[5:0]);
     wire b_is_snan = (&opb[14:7]) && !opb[6] && (|opb[5:0]);
-    reg [3:0] mul_select_pipe, mul_snan_pipe;
+    reg [3:0] mul_select_pipe, div_select_pipe, native_snan_pipe;
     always @(posedge clk) begin
         mul_select_pipe <= {mul_select_pipe[2:0], op_is_mul};
-        mul_snan_pipe <= {mul_snan_pipe[2:0], a_is_snan || b_is_snan};
+        div_select_pipe <= {div_select_pipe[2:0], op_is_div};
+        native_snan_pipe <= {native_snan_pipe[2:0], a_is_snan || b_is_snan};
     end
     wire select_native_mul = mul_select_pipe[3];
+    wire select_native_div = div_select_pipe[3];
 
-    // The legacy FP32 core misclassifies Inf/Inf and shows misaligned
-    // infinity-pair add/sub results in streaming mode. Multiplication is now
-    // fully handled by the native datapath. Keep the add/sub/div overrides.
+    // The legacy FP32 core shows misaligned infinity-pair add/sub results in
+    // streaming mode. Native mul/div handle their own special cases.
     wire opa_is_inf = (&opa[14:7]) && !(|opa[6:0]);
     wire opb_is_inf = (&opb[14:7]) && !(|opb[6:0]);
     wire inf_pair = opa_is_inf && opb_is_inf;
     wire addsub_pair = inf_pair && (fpu_op == 3'd0 || fpu_op == 3'd1);
     wire effective_b_sign = opb[15] ^ (fpu_op == 3'd1);
     wire addsub_same_sign = opa[15] == effective_b_sign;
-    reg [3:0] div_nan_pipe;
     reg [3:0] addsub_inf_pipe, addsub_nan_pipe, addsub_sign_pipe;
     always @(posedge clk) begin
-        div_nan_pipe <= {div_nan_pipe[2:0], inf_pair && (fpu_op == 3'd3)};
         addsub_inf_pipe <= {addsub_inf_pipe[2:0], addsub_pair && addsub_same_sign};
         addsub_nan_pipe <= {addsub_nan_pipe[2:0], addsub_pair && !addsub_same_sign};
         addsub_sign_pipe <= {addsub_sign_pipe[2:0], opa[15]};
     end
-    wire corrected_div_nan = div_nan_pipe[3];
     wire corrected_inf = addsub_inf_pipe[3];
-    wire corrected_nan = corrected_div_nan || addsub_nan_pipe[3];
+    wire corrected_nan = addsub_nan_pipe[3];
     wire corrected_special = corrected_inf || corrected_nan;
     wire corrected_sign = addsub_sign_pipe[3];
 
     // BF16 encodings are exact FP32 numbers when 16 zero fraction bits
     // are appended. Keep opa/opb widths constant for all arithmetic ops.
-    // Multiplication requests are remapped to add inside the legacy core;
-    // its output is ignored on those cycles. Synthesis must still be checked
-    // to determine whether the unused FP32 multiplier logic is eliminated.
-    wire [2:0] legacy_op = op_is_mul ? 3'd0 : fpu_op;
+    // Only add/sub require legacy arithmetic. Redirect native mul/div and
+    // unsupported int conversion operations to add, whose output is ignored.
+    // This should permit the wide FP32 mul/div datapaths to be pruned in
+    // synthesis; a controlled synthesis run must verify the actual savings.
+    wire [2:0] legacy_op = (fpu_op == 3'd1) ? 3'd1 : 3'd0;
     fpu u_fp32 (
         .clk(clk), .rmode(rmode), .fpu_op(legacy_op),
         .opa({opa, 16'h0000}), .opb({opb, 16'h0000}),
@@ -123,6 +134,7 @@ module fpu_bf16_wrapper (
     // FP32 NaNs can have their payload exclusively in the low 16 fraction
     // bits; preserve the NaN class rather than accidentally producing Inf.
     assign out = select_native_mul ? native_mul_result :
+                 select_native_div ? native_div_result :
                  corrected_inf ? {corrected_sign, 8'hff, 7'b0} :
                  corrected_nan ? 16'h7fc0 :
                  fp32_is_nan ? {top[15], 8'hff, 1'b1, 6'b0} :
@@ -138,23 +150,29 @@ module fpu_bf16_wrapper (
     // These status flags include BF16 output quantization. Full IEEE-754
     // flag equivalence is a separate verification target for the native core.
     assign ine = select_native_mul ? native_mul_inexact :
+                 select_native_div ? native_div_inexact :
                  (!corrected_special && bf16_inexact);
     assign overflow = select_native_mul ? native_mul_overflow :
+                      select_native_div ? native_div_overflow :
                       (!corrected_special && (fp32_overflow ||
                       (finite && exponent == 8'hfe &&
                        (&top[6:0]) && discarded_nonzero)));
     assign underflow = select_native_mul ? native_mul_underflow :
+                       select_native_div ? native_div_underflow :
                        (!corrected_special && (fp32_underflow ||
                        (finite && bf16_is_subnormal_or_zero && bf16_inexact)));
     assign inf = select_native_mul ? bf16_is_inf :
+                 select_native_div ? bf16_is_inf :
                  (corrected_inf ||
                   (!corrected_special && (fp32_inf || (!fp32_is_nan && bf16_is_inf))));
     assign zero = bf16_is_zero;
     assign qnan = select_native_mul ? (bf16_is_nan || native_mul_invalid) :
+                  select_native_div ? (bf16_is_nan || native_div_invalid) :
                   (corrected_nan || (!corrected_special && fp32_qnan));
-    assign snan = select_native_mul ? mul_snan_pipe[3] :
+    assign snan = (select_native_mul || select_native_div) ? native_snan_pipe[3] :
                   (!corrected_special && fp32_snan);
     assign div_by_zero = select_native_mul ? 1'b0 :
+                         select_native_div ? native_div_by_zero :
                          (!corrected_special && fp32_div_by_zero);
 
 endmodule
