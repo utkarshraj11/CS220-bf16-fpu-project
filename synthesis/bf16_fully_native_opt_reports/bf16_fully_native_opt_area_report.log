@@ -1,0 +1,43 @@
+ 
+****************************************
+Report : area
+Design : fpu_bf16_wrapper
+Version: W-2024.09-SP5-4
+Date   : Sun Nov  1 18:20:32 2026
+****************************************
+
+Library(s) Used:
+
+    saed32rvt_ss0p7v125c (File: /usr/local/synopsys/pdk/SAED32_EDK/lib/stdcell_rvt/db_nldm/saed32rvt_ss0p7v125c.db)
+
+Number of ports:                           62
+Number of nets:                          5633
+Number of cells:                         5238
+Number of combinational cells:           4968
+Number of sequential cells:               267
+Number of macros/black boxes:               0
+Number of buf/inv:                       1077
+Number of references:                      64
+
+Combinational area:              11997.375871
+Buf/Inv area:                     1595.261903
+Noncombinational area:            1769.350585
+Macro/Black Box area:                0.000000
+Net Interconnect area:            2806.508007
+
+Total cell area:                 13766.726456
+Total area:                      16573.234463
+
+Hierarchical area distribution
+------------------------------
+
+                                  Global cell area            Local cell area
+                                  -------------------  ----------------------------- 
+Hierarchical cell                 Absolute    Percent  Combi-      Noncombi-  Black-
+                                  Total       Total    national    national   boxes   Design
+--------------------------------  ----------  -------  ----------  ---------  ------  ---------
+fpu_bf16_wrapper                  13766.7265    100.0  11997.3759  1769.3506  0.0000  fpu_bf16_wrapper
+--------------------------------  ----------  -------  ----------  ---------  ------  ---------
+Total                                                  11997.3759  1769.3506  0.0000
+
+1

@@ -218,8 +218,10 @@ module bf16_addsub_comb (
     end
 endmodule
 
-// Four-edge pipeline: capture operands on edge 1, compute on edge 2,
-// and delay the registered result through edges 3 and 4.
+// Four-edge pipeline with work balanced across the first three edges.
+// Edge 1 aligns and classifies operands; edge 2 adds/subtracts; edge 3
+// normalizes, rounds, and generates flags; edge 4 presents the output.
+// This preserves the externally visible latency of the original pipeline.
 module bf16_addsub_pipeline (
     input wire clk,
     input wire [15:0] opa,
@@ -232,28 +234,286 @@ module bf16_addsub_pipeline (
     output reg overflow,
     output reg underflow
 );
-    reg [15:0] opa_r, opb_r;
-    reg subtract_r;
-    reg [1:0] rmode_r;
-    wire [15:0] comb_result;
-    wire comb_invalid, comb_inexact, comb_overflow, comb_underflow;
-    reg [19:0] stage2, stage3;
+    // The combinational reference module above remains available for
+    // standalone testing. The pipelined implementation uses the same
+    // arithmetic, but registers intermediate values at useful boundaries.
+    function [10:0] shift_right_jam;
+        input [10:0] value;
+        input [7:0] distance;
+        reg [10:0] shifted;
+        reg lost;
+        integer j;
+        begin
+            shifted = 0;
+            lost = 0;
+            if (distance == 0) begin
+                shifted = value;
+            end else if (distance >= 11) begin
+                shifted = {10'b0, (|value)};
+            end else begin
+                shifted = value >> distance;
+                for (j = 0; j < 11; j = j + 1)
+                    if (j < distance && value[j]) lost = 1;
+                shifted[0] = shifted[0] | lost;
+            end
+            shift_right_jam = shifted;
+        end
+    endfunction
 
-    bf16_addsub_comb u_addsub (
-        .opa(opa_r), .opb(opb_r), .subtract(subtract_r),
-        .rmode(rmode_r), .result(comb_result),
-        .invalid(comb_invalid), .inexact(comb_inexact),
-        .overflow(comb_overflow), .underflow(comb_underflow)
-    );
+    // A priority encoder replaces the former eleven serial conditional
+    // normalizing shifts and exponent decrements.
+    function [3:0] leading_zeroes11;
+        input [10:0] value;
+        begin
+            casez (value)
+                11'b1??????????: leading_zeroes11 = 4'd0;
+                11'b01?????????: leading_zeroes11 = 4'd1;
+                11'b001????????: leading_zeroes11 = 4'd2;
+                11'b0001???????: leading_zeroes11 = 4'd3;
+                11'b00001??????: leading_zeroes11 = 4'd4;
+                11'b000001?????: leading_zeroes11 = 4'd5;
+                11'b0000001????: leading_zeroes11 = 4'd6;
+                11'b00000001???: leading_zeroes11 = 4'd7;
+                11'b000000001??: leading_zeroes11 = 4'd8;
+                11'b0000000001?: leading_zeroes11 = 4'd9;
+                11'b00000000001: leading_zeroes11 = 4'd10;
+                default:         leading_zeroes11 = 4'd11;
+            endcase
+        end
+    endfunction
 
+    wire [7:0] expa = opa[14:7];
+    wire [7:0] expb = opb[14:7];
+    wire [6:0] fra = opa[6:0];
+    wire [6:0] frb = opb[6:0];
+    wire a_nan = (&expa) && (|fra);
+    wire b_nan = (&expb) && (|frb);
+    wire a_snan = a_nan && !fra[6];
+    wire b_snan = b_nan && !frb[6];
+    wire a_inf = (&expa) && !(|fra);
+    wire b_inf = (&expb) && !(|frb);
+    wire a_zero = !(|opa[14:0]);
+    wire b_zero = !(|opb[14:0]);
+    wire effective_b_sign = opb[15] ^ subtract;
+    wire [7:0] ea = (expa == 0) ? 8'd1 : expa;
+    wire [7:0] eb = (expb == 0) ? 8'd1 : expb;
+    wire [7:0] sig_a = {expa != 0, fra};
+    wire [7:0] sig_b = {expb != 0, frb};
+
+    // First combinational stage: exponent alignment and special values.
+    reg [10:0] aligned_a_c, aligned_b_c;
+    reg [8:0] exp_c;
+    reg special_c, special_invalid_c;
+    reg [15:0] special_result_c;
+    always @* begin
+        aligned_a_c = 0;
+        aligned_b_c = 0;
+        exp_c = 9'd1;
+        special_c = 0;
+        special_invalid_c = 0;
+        special_result_c = 0;
+
+        if (ea >= eb) begin
+            exp_c = {1'b0, ea};
+            aligned_a_c = {sig_a, 3'b0};
+            aligned_b_c = shift_right_jam({sig_b, 3'b0}, ea - eb);
+        end else begin
+            exp_c = {1'b0, eb};
+            aligned_a_c = shift_right_jam({sig_a, 3'b0}, eb - ea);
+            aligned_b_c = {sig_b, 3'b0};
+        end
+
+        if (a_nan || b_nan) begin
+            special_c = 1;
+            special_result_c = 16'h7fc0;
+            special_invalid_c = a_snan || b_snan;
+        end else if (a_inf && b_inf) begin
+            special_c = 1;
+            if (opa[15] != effective_b_sign) begin
+                special_result_c = 16'h7fc0;
+                special_invalid_c = 1;
+            end else begin
+                special_result_c = {opa[15], 8'hff, 7'b0};
+            end
+        end else if (a_inf) begin
+            special_c = 1;
+            special_result_c = {opa[15], 8'hff, 7'b0};
+        end else if (b_inf) begin
+            special_c = 1;
+            special_result_c = {effective_b_sign, 8'hff, 7'b0};
+        end else if (a_zero && b_zero) begin
+            special_c = 1;
+            special_result_c = {(opa[15] == effective_b_sign) ?
+                                opa[15] : (rmode == 2'd3), 15'b0};
+        end
+    end
+
+    reg [10:0] aligned_a_s1, aligned_b_s1;
+    reg [8:0] exp_s1;
+    reg sign_a_s1, sign_b_s1;
+    reg [1:0] mode_s1;
+    reg special_s1, special_invalid_s1;
+    reg [15:0] special_result_s1;
+
+    // Second combinational stage: the shared add/subtract datapath.
+    reg [11:0] sum_c;
+    reg sign_c;
+    always @* begin
+        sum_c = 0;
+        sign_c = 0;
+        if (sign_a_s1 == sign_b_s1) begin
+            sign_c = sign_a_s1;
+            sum_c = {1'b0, aligned_a_s1} + {1'b0, aligned_b_s1};
+        end else if (aligned_a_s1 > aligned_b_s1) begin
+            sign_c = sign_a_s1;
+            sum_c = {1'b0, aligned_a_s1 - aligned_b_s1};
+        end else if (aligned_b_s1 > aligned_a_s1) begin
+            sign_c = sign_b_s1;
+            sum_c = {1'b0, aligned_b_s1 - aligned_a_s1};
+        end else begin
+            sign_c = (mode_s1 == 2'd3);
+        end
+    end
+
+    reg [11:0] sum_s2;
+    reg sign_s2;
+    reg [8:0] exp_s2;
+    reg [1:0] mode_s2;
+    reg special_s2, special_invalid_s2;
+    reg [15:0] special_result_s2;
+
+    // Third combinational stage: normalize, round, and set IEEE flags.
+    reg [15:0] final_result_c;
+    reg invalid_c, inexact_c, overflow_c, underflow_c;
+    reg [10:0] magnitude_c;
+    reg [8:0] exp_work_c, headroom_c;
+    reg [3:0] zeros_c, shift_c;
+    reg [7:0] retained_c;
+    reg [8:0] rounded_c;
+    reg guard_c, round_c, sticky_c, round_up_c, above_max_c;
+    always @* begin
+        final_result_c = 0;
+        invalid_c = 0;
+        inexact_c = 0;
+        overflow_c = 0;
+        underflow_c = 0;
+        magnitude_c = 0;
+        exp_work_c = exp_s2;
+        headroom_c = 0;
+        zeros_c = 0;
+        shift_c = 0;
+        retained_c = 0;
+        rounded_c = 0;
+        guard_c = 0;
+        round_c = 0;
+        sticky_c = 0;
+        round_up_c = 0;
+        above_max_c = 0;
+
+        if (special_s2) begin
+            final_result_c = special_result_s2;
+            invalid_c = special_invalid_s2;
+        end else if (sum_s2 == 0) begin
+            final_result_c = {sign_s2, 15'b0};
+        end else begin
+            if (sum_s2[11]) begin
+                magnitude_c = sum_s2[11:1];
+                magnitude_c[0] = magnitude_c[0] | sum_s2[0];
+                exp_work_c = exp_s2 + 9'd1;
+            end else begin
+                magnitude_c = sum_s2[10:0];
+            end
+
+            zeros_c = leading_zeroes11(magnitude_c);
+            headroom_c = exp_work_c - 9'd1;
+            if (headroom_c < {5'b0, zeros_c})
+                shift_c = headroom_c[3:0];
+            else
+                shift_c = zeros_c;
+            magnitude_c = magnitude_c << shift_c;
+            exp_work_c = exp_work_c - {5'b0, shift_c};
+
+            retained_c = magnitude_c[10:3];
+            guard_c = magnitude_c[2];
+            round_c = magnitude_c[1];
+            sticky_c = magnitude_c[0];
+            inexact_c = guard_c || round_c || sticky_c;
+            case (mode_s2)
+                2'd0: round_up_c = guard_c &&
+                     (round_c || sticky_c || retained_c[0]);
+                2'd1: round_up_c = 0;
+                2'd2: round_up_c = !sign_s2 && inexact_c;
+                2'd3: round_up_c = sign_s2 && inexact_c;
+            endcase
+            rounded_c = {1'b0, retained_c} + {8'b0, round_up_c};
+
+            above_max_c = (exp_work_c > 9'd254) ||
+                          (exp_work_c == 9'd254 &&
+                           retained_c == 8'hff && inexact_c);
+            if (above_max_c) begin
+                overflow_c = 1;
+                inexact_c = 1;
+                if ((mode_s2 == 2'd0 &&
+                     (exp_work_c > 9'd254 || round_up_c)) ||
+                    (mode_s2 == 2'd2 && !sign_s2) ||
+                    (mode_s2 == 2'd3 && sign_s2))
+                    final_result_c = {sign_s2, 8'hff, 7'b0};
+                else
+                    final_result_c = {sign_s2, 8'hfe, 7'h7f};
+            end else if (exp_work_c == 9'd1 && !magnitude_c[10]) begin
+                if (rounded_c[7])
+                    final_result_c = {sign_s2, 8'h01, 7'b0};
+                else
+                    final_result_c = {sign_s2, 8'h00, rounded_c[6:0]};
+                underflow_c = inexact_c && (final_result_c[14:7] == 0);
+            end else begin
+                if (rounded_c[8]) begin
+                    rounded_c = rounded_c >> 1;
+                    exp_work_c = exp_work_c + 9'd1;
+                end
+                if (exp_work_c >= 9'd255) begin
+                    overflow_c = 1;
+                    inexact_c = 1;
+                    if (mode_s2 == 2'd0 ||
+                        (mode_s2 == 2'd2 && !sign_s2) ||
+                        (mode_s2 == 2'd3 && sign_s2))
+                        final_result_c = {sign_s2, 8'hff, 7'b0};
+                    else
+                        final_result_c = {sign_s2, 8'hfe, 7'h7f};
+                end else begin
+                    final_result_c = {sign_s2, exp_work_c[7:0], rounded_c[6:0]};
+                end
+            end
+        end
+    end
+
+    reg [19:0] stage3_packet;
     always @(posedge clk) begin
-        opa_r <= opa;
-        opb_r <= opb;
-        subtract_r <= subtract;
-        rmode_r <= rmode;
-        stage2 <= {comb_invalid, comb_inexact, comb_overflow,
-                   comb_underflow, comb_result};
-        stage3 <= stage2;
-        {invalid, inexact, overflow, underflow, result} <= stage3;
+        // Edge 1: alignment and special-case classification.
+        aligned_a_s1 <= aligned_a_c;
+        aligned_b_s1 <= aligned_b_c;
+        exp_s1 <= exp_c;
+        sign_a_s1 <= opa[15];
+        sign_b_s1 <= effective_b_sign;
+        mode_s1 <= rmode;
+        special_s1 <= special_c;
+        special_invalid_s1 <= special_invalid_c;
+        special_result_s1 <= special_result_c;
+
+        // Edge 2: significand arithmetic.
+        sum_s2 <= sum_c;
+        sign_s2 <= sign_c;
+        exp_s2 <= exp_s1;
+        mode_s2 <= mode_s1;
+        special_s2 <= special_s1;
+        special_invalid_s2 <= special_invalid_s1;
+        special_result_s2 <= special_result_s1;
+
+        // Edge 3: normalization and rounding.
+        stage3_packet <= {invalid_c, inexact_c, overflow_c,
+                          underflow_c, final_result_c};
+
+        // Edge 4: externally visible result.
+        {invalid, inexact, overflow, underflow, result} <= stage3_packet;
     end
 endmodule
