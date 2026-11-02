@@ -6,7 +6,7 @@
 # previous multiplier-only BF16 hybrid. Reports remain in a new directory.
 
 set ROOT "$env(HOME)/cs220_final_project"
-set RTL_DIR "$ROOT/bf16_mul_div/verilog"
+set RTL_DIR "$ROOT/bf16_mul_div"
 set REPORT_DIR "$ROOT/syn/bf16_mul_div_reports"
 
 file mkdir $REPORT_DIR
