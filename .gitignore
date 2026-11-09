@@ -1,5 +1,7 @@
 __pycache__/
-*.pyc# simulation / tool outputs
+*.pyc
+
+# simulation / tool outputs (regenerate with scripts/)
 sim/
 *.vcd
 *.vvp
@@ -8,14 +10,11 @@ csrc/
 ucli.key
 DVEfiles/
 *.daidir
-synthesis/logs/
 command.log
 default.svf
 filenames.log
-*.sdf
-# Kept locally for the report; regenerate with scripts/syn.sh and scripts/netlist_sim.sh
-synthesis/*_p*/*_netlist.v
-synthesis/*_p*/*.sdf
+
+# large synthesis outputs kept on Bender only (regenerate with scripts/syn.sh)
 synthesis/logs/
-sim/
-*.vcd
+synthesis/*_p*/*_netlist.v
+*.sdf
