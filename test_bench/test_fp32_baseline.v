@@ -30,7 +30,7 @@ module test_fp32_baseline;
   reg [31:0] v_a [0:MAXV-1], v_b [0:MAXV-1], v_exp [0:MAXV-1];
   reg [3:0]  v_flg [0:MAXV-1];
   reg [8*64-1:0] v_name [0:MAXV-1];
-  integer n, i, fd, rc, errors, checked, issued;
+  integer n, i, fd, rc, errors, checked;
   reg [8*256-1:0] vecfile, vcdfile, line;
   reg verbose;
 
@@ -54,7 +54,7 @@ module test_fp32_baseline;
   endtask
 
   initial begin
-    errors = 0; checked = 0; issued = 0; n = 0;
+    errors = 0; checked = 0; n = 0;
     verbose = $test$plusargs("VERBOSE");
     if (!$value$plusargs("VECTORS=%s", vecfile)) vecfile = "test_vectors/fp32_baseline_vectors.hex";
     if ($value$plusargs("VCD=%s", vcdfile)) begin
@@ -75,29 +75,45 @@ module test_fp32_baseline;
     $display("Loaded %0d vectors from %0s (latency %0d cycles)", n, vecfile, LAT);
   end
 
-  // drive on falling edge, one new operation per cycle
-  always @(negedge clk) begin
-    if (n > 0 && issued < n) begin
-      fpu_op <= v_oprm[issued][6:4];
-      rmode  <= v_oprm[issued][1:0];
-      opa    <= v_a[issued];
-      opb    <= v_b[issued];
-      issued <= issued + 1;
+  // Drive one operation per cycle on the falling edge, after the vectors are
+  // loaded. cur_idx tags which vector is on the inputs (-1 = idle), so result
+  // checking never depends on counting clock edges from time 0 (simulators
+  // differ on whether clk's x->0 initialisation counts as an edge).
+  integer cur_idx = -1;
+  reg loaded = 0;
+  initial begin
+    wait (n > 0);
+    loaded = 1;
+    @(posedge clk);
+    for (i = 0; i < n; i = i + 1) begin
+      @(negedge clk);
+      fpu_op  = v_oprm[i][6:4];
+      rmode   = v_oprm[i][1:0];
+      opa     = v_a[i];
+      opb     = v_b[i];
+      cur_idx = i;
     end
+    @(negedge clk);
+    cur_idx = -1;
   end
 
-  // operation k is captured on rising edge k+1 and appears LAT edges later;
-  // sample just before the next falling edge
-  integer edges = 0;
+  // hist[k] = vector index captured k rising edges ago. The FPU registers its
+  // inputs on the capture edge and shows the result after LAT-1 further edges.
+  integer hist [0:LAT-1];
+  integer h;
+  initial for (h = 0; h < LAT; h = h + 1) hist[h] = -1;
   always @(posedge clk) begin
-    edges = edges + 1;
+    for (h = LAT-1; h > 0; h = h - 1) hist[h] = hist[h-1];
+    hist[0] = loaded ? cur_idx : -1;
     #(PERIOD/4.0);
-    if (edges - LAT >= 1 && edges - LAT <= n) check(edges - LAT - 1);
-    if (n > 0 && edges - LAT == n) begin
-      $display("RESULT: %0d / %0d checks passed, %0d failed", checked - errors, checked, errors);
-      if (errors) $fatal(1, "FP32 baseline: %0d mismatches", errors);
-      $display("ALL TESTS PASSED");
-      $finish;
+    if (hist[LAT-1] >= 0) begin
+      check(hist[LAT-1]);
+      if (hist[LAT-1] == n - 1) begin
+        $display("RESULT: %0d / %0d checks passed, %0d failed", checked - errors, checked, errors);
+        if (errors) $fatal(1, "FP32 baseline: %0d mismatches", errors);
+        $display("ALL TESTS PASSED");
+        $finish;
+      end
     end
   end
 endmodule

@@ -12,3 +12,10 @@ synthesis/logs/
 command.log
 default.svf
 filenames.log
+*.sdf
+# Kept locally for the report; regenerate with scripts/syn.sh and scripts/netlist_sim.sh
+synthesis/*_p*/*_netlist.v
+synthesis/*_p*/*.sdf
+synthesis/logs/
+sim/
+*.vcd
