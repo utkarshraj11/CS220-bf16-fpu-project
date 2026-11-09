@@ -1,2 +1,14 @@
 __pycache__/
-*.pyc
+*.pyc# simulation / tool outputs
+sim/
+*.vcd
+*.vvp
+simv*
+csrc/
+ucli.key
+DVEfiles/
+*.daidir
+synthesis/logs/
+command.log
+default.svf
+filenames.log
